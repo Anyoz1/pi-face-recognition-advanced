@@ -1,81 +1,232 @@
-# Edge AI Face Recognition System (ArcFace + YuNet)
+# Pi Face Recognition Access Control
 
-This repository contains an optimized, lightweight biometric access control system (PACS / СКУД) designed to run locally on Edge devices like the **Orange Pi 5B (Rockchip RK3588)**. 
+Локальная СКУД-система на Orange Pi 5B с распознаванием лиц. Проект использует YuNet для детекции, ArcFace для построения embeddings, бинарную базу `database_bin/*.bin` и веб-админку для управления людьми и логами. Всё работает локально, без облачных сервисов.
 
-The system leverages **YuNet** for ultra-fast face detection and **ArcFace (ResNet50)** for high-accuracy feature extraction and cosine similarity matching, operating entirely offline without cloud dependencies.
+## Возможности
 
----
+- Распознавание лиц с камеры в реальном времени.
+- Полностью локальная работа без отправки кадров или embeddings в облако.
+- База людей в формате `database_bin/*.bin`.
+- Добавление людей через admin-сайт.
+- Удаление людей через admin-сайт.
+- Просмотр логов работы СКУД.
+- Два режима FPS: standby для ожидания и active при найденном лице.
+- Early accept: быстрый пропуск при уверенном совпадении.
+- Фильтр анфаса по landmarks.
+- Фильтр резкости, чтобы не принимать смазанные кадры.
+- Контроль CPU и температуры устройства в логах.
+- Опциональный web/live режим с камерой и live frame/stream.
 
-## ⚡ Performance & Telemetry (Orange Pi 5B)
+## Как работает pipeline
 
-* **Face Detection (YuNet):** ~10–15 ms (on downscaled 160x120 stream)
-* **Feature Extraction (ArcFace):** ~150–160 ms (on CPU, single-thread OpenCV DNN backend)
-* **Average CPU Load:** ~25–30%
-* **Average RAM Footprint:** ~850 MB
-* **Operational Temperature:** ~53°C–56°C (Passive cooling friendly)
+1. Камера получает кадр.
+2. YuNet ищет лицо на уменьшенном изображении.
+3. Из найденных лиц выбирается самое крупное.
+4. Проверяется минимальный размер лица.
+5. По landmarks считается `frontal_score`.
+6. Если лицо повернуто боком, кадр игнорируется.
+7. По 5 landmarks выполняется alignment лица.
+8. Лицо приводится к размеру `112x112`.
+9. ArcFace создаёт embedding: 512 значений `float32`.
+10. Embedding нормализуется.
+11. `database_bin/` загружается как матрица embeddings.
+12. Сравнение идёт через dot product, то есть cosine similarity для нормализованных векторов.
+13. Если `score >= ACCEPT_THRESHOLD`, доступ разрешён.
+14. Если `REJECT_THRESHOLD <= score < ACCEPT_THRESHOLD`, результат считается сомнительным.
+15. Если `score < REJECT_THRESHOLD`, человек считается неизвестным.
 
----
+## Что оптимизировано
 
-## 🛠️ Tech Stack & Dependencies
+- Основной recognition loop написан на C++.
+- Детектор работает на кадре `160x120`, чтобы снизить нагрузку.
+- Standby FPS снижает нагрев и расход CPU в режиме ожидания.
+- Active FPS включается, когда в кадре появляется лицо.
+- Используется серия кадров и выбор лучшего кадра по качеству.
+- Early accept завершает проверку раньше при хорошем score.
+- База embeddings хранится в бинарном формате.
+- Сравнение со всеми людьми выполняется одной матричной операцией.
+- В логах фиксируется время этапов `det`, `arc`, `match`.
+- В логах фиксируются CPU и температура.
 
-* **Runtime / Package Manager:** `uv` (Fast Python package installer and resolver)
-* **Core Libraries:** `opencv-python` (DNN module), `numpy`, `psutil`
-* **Models (ONNX format):**
-  * Detection: `face_detection_yunet_2023mar.onnx`
-  * Recognition: `w600k_r50.onnx` (ArcFace Heavy industrial model)
+## Модели
 
----
+- `models/face_detection_yunet.onnx` — YuNet detector.
+- `models/arcface.onnx` — ArcFace embedding model.
 
-## 📁 Repository Structure
+Модели работают локально через OpenCV DNN. Без файлов в `models/` проект не запустит детекцию и распознавание.
+
+## База людей
+
+База распознавания лежит в `database_bin/`.
+
+Формат:
+
+```text
+database_bin/<name>.bin
+```
+
+Один `.bin` файл содержит один ArcFace embedding:
+
+```text
+512 float32 = 2048 bytes
+```
+
+Это embedding, а не фотография. Директория `dataset/` хранит исходные фото или кадры регистрации, а `database_bin/` нужен непосредственно для распознавания.
+
+## Главные файлы
+
+- `face_id.cpp` — основной СКУД и главный recognition loop.
+- `admin_server.py` — веб-админка для базы, логов и добавления людей.
+- `Makefile` — сборка C++ бинарников.
+- `face_id_web.cpp` — опциональный live/web режим.
+- `register_face.cpp` — CLI регистрация в `database_bin/`; важно, чтобы preprocessing регистрации совпадал с `face_id.cpp`.
+- `test_speed.cpp` — тест скорости и диагностика производительности.
+- `test_single.py` / `test_multi.py` — Python диагностика.
+- `PROJECT_FILES.md` — подробное описание структуры проекта.
+- `RUN_COMMANDS.md` — рабочие команды запуска и обслуживания.
+- `archive_unused/` — старые файлы, сохранённые как архив.
+
+## Установка зависимостей
+
+Для Orange Pi / Debian / Armbian:
+
+```bash
+sudo apt update
+sudo apt install -y build-essential pkg-config libopencv-dev python3-venv python3-opencv python3-numpy
+```
+
+Python admin server через venv:
+
+```bash
+python3 -m venv --system-site-packages .admin-venv
+source .admin-venv/bin/activate
+pip install fastapi uvicorn python-multipart
+```
+
+Если используется `uv`:
+
+```bash
+uv sync
+```
+
+## Сборка
+
+```bash
+make face_id
+make face_id_web
+make register_face
+make test_speed
+```
+
+## Запуск СКУД
+
+```bash
+mkdir -p web_live
+stdbuf -oL -eL ./face_id 2>&1 | tee -a web_live/face_id.log
+```
+
+## Запуск admin server
+
+```bash
+source .admin-venv/bin/activate
+python admin_server.py --host 0.0.0.0 --port 8080
+```
+
+Открыть:
+
+```text
+http://<ORANGE_PI_IP>:8080
+```
+
+## Добавление человека
+
+Рекомендуемый способ для текущей версии — через `admin_server.py`, потому что он создаёт `database_bin/<name>.bin` с preprocessing, совместимым с текущим `face_id.cpp`.
+
+Через сайт:
+
+1. Открыть admin server.
+2. Ввести имя.
+3. Загрузить одно или несколько фото.
+4. Нажать создать BIN.
+5. Проверить `database_bin/<name>.bin`.
+
+## Удаление человека
+
+Через admin-сайт: нажать `Удалить` рядом с человеком.
+
+Через терминал:
+
+```bash
+rm database_bin/person.bin
+```
+
+## Проверка
+
+Проверить базу:
+
+```bash
+ls -lh database_bin
+stat -c '%n %s bytes' database_bin/*.bin
+```
+
+Проверить ключевые параметры в `face_id.cpp`:
+
+```bash
+grep -n "ACCEPT_THRESHOLD|REJECT_THRESHOLD|STANDBY_FPS|ACTIVE_FPS|MIN_FRONTAL_SCORE" face_id.cpp | head -30
+```
+
+## Структура проекта
+
+Компактная структура без больших файлов:
 
 ```text
 .
-├── dataset/              # Local biometric database (Ignored by Git for privacy)
+├── Makefile
+├── README.md
+├── PROJECT_FILES.md
+├── RUN_COMMANDS.md
+├── admin_server.py
+├── face_id.cpp
+├── face_id_test.cpp
+├── face_id_web.cpp
+├── register_face.cpp
+├── test_speed.cpp
+├── test_single.py
+├── test_multi.py
+├── pyproject.toml
+├── uv.lock
+├── archive_unused/
+├── database_bin/
 │   └── .gitkeep
-├── models/               # Pre-trained ONNX models (Ignored by Git)
-│   ├── arcface.onnx
-│   └── face_detection_yunet.onnx
-├── face_id.py            # Main verification & access control pipeline
-├── register_face.py      # Automated face enrollment utility
-├── pyproject.toml        # Project metadata and dependencies managed by uv
-└── uv.lock               # Locked dependency tree
+├── dataset/
+│   └── .gitkeep
+├── models/
+│   └── .gitkeep
+├── web_live/
+│   └── .gitkeep
+└── history_logs/
+    └── .gitkeep
+```
 
-    🔒 Privacy Note: The dataset/ directory contains sensitive biometric data (user photos). It is strictly blocked via .gitignore to prevent leaking personal records to public repositories.
+## Безопасность и приватность
 
-🚀 Quick Start Guide
-1. Installation & Environment Setup
+- `database_bin/` содержит биометрические embeddings.
+- `dataset/` может содержать фотографии людей.
+- `history_logs/` может содержать кадры проходов.
+- Эти данные не стоит пушить в публичный GitHub.
+- Система работает локально, без облачной обработки.
 
-Clone the repository to your single-board computer and sync the environment using uv:
-Bash
+## Что не пушить
 
-cd ~/pi-face-recognition-advanced
-uv sync
+`.gitignore` исключает приватные и тяжёлые runtime-файлы:
 
-2. Download Pre-trained Models
+- `database_bin/`
+- `dataset/`
+- `history_logs/`
+- `web_live/`
+- `.admin-venv/`
+- бинарники сборки;
+- ONNX модели, если они большие.
 
-If you are setting up the project on a new device, download the required weights into the models/ directory:
-Bash
-
-mkdir -p models
-wget -O models/face_detection_yunet.onnx "[https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx](https://github.com/opencv/opencv_zoo/raw/main/models/face_detection_yunet/face_detection_yunet_2023mar.onnx)"
-wget -O models/arcface.onnx "[https://github.com/yakhyo/facial-analysis/releases/download/v0.0.1/w600k_r50.onnx](https://github.com/yakhyo/facial-analysis/releases/download/v0.0.1/w600k_r50.onnx)"
-
-3. Enroll New Users (Face Capture)
-
-Run the interactive script to capture a high-quality face profile directly from the USB/CSI camera. The script waits for stable face placement before saving the template:
-Bash
-
-uv run python register_face.py
-
-Input the user's name when prompted (e.g., sultan, tilek). The file will be securely saved under dataset/{name}.jpg.
-4. Launch Biometric Recognition
-
-Start the live access control monitoring cycle:
-Bash
-
-uv run python face_id.py
-
-The engine continuously loops, running fast detection scans. Once a face is detected, it triggers the heavy ArcFace encoder, matches vectors using Cosine Similarity (threshold > 0.38), and displays comprehensive hardware telemetry upon access authorization.
-🔮 Future Architecture Roadmap
-
-    Distributed Network: Transition to a split architecture. The Orange Pi 5B will act as an Edge compute node (camera stream processing and hardware trigger), while a dedicated centralized server (FastAPI hosted on a host machine) will manage remote database logs, batch synchronization, and administrative controls.
+Папки сохраняются в репозитории через `.gitkeep`, но их содержимое не попадает в GitHub.
+# Pi-Face-Recognition-Access-Control
